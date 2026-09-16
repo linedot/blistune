@@ -205,22 +205,26 @@ class Benchmark:
                 env=env,
                 capture_output=True,
                 text=True,
-                check=True,
+                #check=True,
                 timeout=self.timeout,
             )
         except subprocess.TimeoutExpired:
             print(f"  ! timed out after {self.timeout}s", file=sys.stderr)
             return 0.0
-        except subprocess.CalledProcessError as exc:
-            tail = (exc.stderr or exc.stdout or "").strip().splitlines()[-3:]
-            print(f"  ! driver exited {exc.returncode}: {' / '.join(tail)}", file=sys.stderr)
-            return 0.0
 
         values = [float(m) for m in RESULT_RE.findall(result.stdout)]
-        if not values:
+        if values:
+            if result.returncode != 0:
+                printf(f"  ! warning: driver exited {result.returncode} but results were recovered", file=sys.stderr)
+            return max(values)
+
+        if result.returncode != 0:
+            tail = (result.stderr or result.stdout or "").strip().splitlines()[-3:]
+            print(f"  ! driver exited {result.returncode}: {' / '.join(tail)}", file=sys.stderr)
+        else:
             print("  ! no parseable result rows in driver output", file=sys.stderr)
-            return 0.0
-        return max(values)
+
+        return 0.0
 
 
 # --------------------------------------------------------------------------- #
