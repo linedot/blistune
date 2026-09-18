@@ -142,12 +142,21 @@ def build_parser():
     p.add_argument("--timeout", type=float, default=None,
                    help="per-benchmark wall-clock limit in seconds")
 
+    p.add_argument("-c", "--cpu-mask", default=None,
+                   help="CPU mask for taskset, e.g. '0-35' or '0,2,4-7'. "
+                        "If set, the driver is launched via "
+                        "'taskset -c <mask>'. Python/Optuna are not constrained.")
+
     p.add_argument("--omp-places", default=None,
                    help="OMP_PLACES value (default: '{0}:<threads>:1')")
     p.add_argument("--omp-proc-bind", default="true",
                    help="OMP_PROC_BIND value")
     p.add_argument("-e", "--env", action="append", default=[], metavar="KEY=VALUE",
                    help="extra environment variable for the benchmark (repeatable)")
+
+    p.add_argument("-v", "--verbose", action="store_true",
+                   help="forward the benchmark driver's stdout/stderr to the terminal "
+                        "(useful for OMP_DISPLAY_ENV, OMP_DISPLAY_AFFINITY, etc.)")
 
     p.add_argument("--save-best", type=Path, default=None,
                    help="write the winning configuration to this file as shell exports")
@@ -186,12 +195,13 @@ def parse_extra_env(pairs):
 # --------------------------------------------------------------------------- #
 
 class Benchmark:
-    def __init__(self, exe, workdir, cmd, base_env, timeout):
+    def __init__(self, exe, workdir, cmd, base_env, timeout, verbose=False):
         self.exe = exe
         self.workdir = workdir
         self.cmd = cmd
         self.base_env = base_env
         self.timeout = timeout
+        self.verbose = verbose
 
     def run(self, config):
         env = os.environ.copy()
@@ -205,26 +215,50 @@ class Benchmark:
                 env=env,
                 capture_output=True,
                 text=True,
-                #check=True,
+                check=True,
                 timeout=self.timeout,
             )
-        except subprocess.TimeoutExpired:
+        except subprocess.TimeoutExpired as exc:
             print(f"  ! timed out after {self.timeout}s", file=sys.stderr)
+            if self.verbose:
+                if exc.stdout:
+                    sys.stdout.write(exc.stdout)
+                    sys.stdout.flush()
+                if exc.stderr:
+                    sys.stderr.write(exc.stderr)
+                    sys.stderr.flush()
+            return 0.0
+        except subprocess.CalledProcessError as exc:
+            tail = (exc.stderr or exc.stdout or "").strip().splitlines()[-3:]
+            print(f"  ! driver exited {exc.returncode}: {' / '.join(tail)}", file=sys.stderr)
+            if self.verbose:
+                if exc.stdout:
+                    sys.stdout.write(exc.stdout)
+                    sys.stdout.flush()
+                if exc.stderr:
+                    sys.stderr.write(exc.stderr)
+                    sys.stderr.flush()
             return 0.0
 
+        # ---- verbose forwarding ------------------------------------------ #
+        # The driver's full stdout/stderr is normally swallowed here. When
+        # --verbose is set, write it through so OpenMP diagnostics
+        # (OMP_DISPLAY_ENV, OMP_DISPLAY_AFFINITY, OMP_AFFINITY_FORMAT) and the
+        # driver's own tables show up in the terminal.
+        if self.verbose:
+            if result.stdout:
+                sys.stdout.write(result.stdout)
+                sys.stdout.flush()
+            if result.stderr:
+                sys.stderr.write(result.stderr)
+                sys.stderr.flush()
+
+        # ---- parse GFLOP/s from stdout (always) --------------------------- #
         values = [float(m) for m in RESULT_RE.findall(result.stdout)]
-        if values:
-            if result.returncode != 0:
-                printf(f"  ! warning: driver exited {result.returncode} but results were recovered", file=sys.stderr)
-            return max(values)
-
-        if result.returncode != 0:
-            tail = (result.stderr or result.stdout or "").strip().splitlines()[-3:]
-            print(f"  ! driver exited {result.returncode}: {' / '.join(tail)}", file=sys.stderr)
-        else:
+        if not values:
             print("  ! no parseable result rows in driver output", file=sys.stderr)
-
-        return 0.0
+            return 0.0
+        return max(values)
 
 
 # --------------------------------------------------------------------------- #
@@ -288,13 +322,19 @@ def main(argv=None):
     if args.layout:
         cmd += ["-s", args.layout]
 
+    # Wrap the driver in taskset if a CPU mask was given. Only the driver is
+    # constrained; Python and Optuna keep their normal scheduling freedom.
+    if args.cpu_mask:
+        cmd = ["taskset", "-c", args.cpu_mask] + cmd
+
     base_env = {
         "OMP_PLACES": args.omp_places or f"{{0}}:{args.threads}:1",
         "OMP_PROC_BIND": args.omp_proc_bind,
     }
     base_env.update(parse_extra_env(args.env))
 
-    benchmark = Benchmark(exe, workdir, cmd, base_env, args.timeout)
+    benchmark = Benchmark(exe, workdir, cmd, base_env, args.timeout,
+                          verbose=args.verbose)
 
     # ---- objective --------------------------------------------------------- #
     def objective(trial):
@@ -306,6 +346,11 @@ def main(argv=None):
             env_name = block_env_names[stem]
             config[env_name] = trial.suggest_int(env_name, low, high, step=step)
 
+        if args.verbose:
+            print(f"\n[trial {trial.number}] config: "
+                  + " ".join(f"{k}={v}" for k, v in sorted(config.items())),
+                  file=sys.stderr)
+
         return benchmark.run(config)
 
     # ---- run --------------------------------------------------------------- #
@@ -315,10 +360,15 @@ def main(argv=None):
     print(f"driver      : {exe}")
     print(f"command     : {' '.join(shlex.quote(c) for c in cmd)}")
     print(f"environment : " + "  ".join(f"{k}={v}" for k, v in base_env.items()))
+    if args.cpu_mask:
+        print(f"taskset     : -c {args.cpu_mask}")
     print(f"threads     : {args.threads} -> {len(thread_space)} valid JC/IC/JR/IR decompositions")
     for stem, (low, high, step) in block_space.items():
         print(f"{block_env_names[stem]:<20}: {low}..{high} step {step}")
-    print(f"trials      : {args.n_trials}\n")
+    print(f"trials      : {args.n_trials}")
+    if args.verbose:
+        print(f"verbose     : on (forwarding driver stdout/stderr)")
+    print()
 
     sampler = optuna.samplers.TPESampler(seed=args.seed) if args.seed is not None else None
     study = optuna.create_study(direction="maximize", sampler=sampler)
